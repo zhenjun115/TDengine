@@ -59,8 +59,9 @@ class _MyForecastService(AbstractForecastService):
         res = []
 
         """这个预测算法固定返回 1 作为预测值，预测值的数量是用户通过 self.fc_rows 指定"""
-        ts_list = [self.start_ts + i * self.time_step for i in range(self.rows)]
-        res.append(ts_list)  # 设置预测结果时间戳列
+        # ts_list = [self.start_ts + i * self.time_step for i in range(self.rows)]
+        timestamp_ms = future_forecast['ds'].astype('int64') // 10 ** 6
+        res.append(timestamp_ms.tolist())  # 设置预测结果时间戳列
 
         """生成全部为 1 的预测结果 """
         res_list = [1] * self.rows
