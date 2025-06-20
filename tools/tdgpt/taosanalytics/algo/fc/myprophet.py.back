@@ -1,0 +1,382 @@
+from taosanalytics.service import AbstractForecastService
+from prophet import Prophet
+import pandas as pd
+import re
+# 算法实现类名称 需要以下划线 "_" 开始，并以 Service 结束
+class _MyForecastService(AbstractForecastService):
+    """ 定义类，从 AbstractForecastService 继承并实现其定义的抽象方法 execute  """
+    name = 'myprophet'
+
+    # 该算法的描述信息 (建议添加)
+    desc = """return the prophet time series data"""
+
+    # Prophet 支持的参数，避免传入不支持的参数
+    allowed_params = [
+        "growth",
+        "changepoint_prior_scale",
+        "changepoint_range",
+        "yearly_seasonality",
+        "weekly_seasonality",
+        "daily_seasonality",
+        "holidays",
+        "seasonality_mode",
+        "seasonality_prior_scale",
+        "holidays_prior_scale",
+        "interval_width",
+        "mcmc_samples",
+        "uncertainty_samples",
+        "stan_backend"
+    ]
+
+    # 节假日支持的参数, 避免传入不支持的参数
+    holidays_params = [
+        "holidays",
+    ]
+
+    # 采样参数, 避免传入不支持的参数
+    resample_params = [
+        "resample",
+        "resample_mode"
+    ]
+
+    # 饱和参数, 避免传入不支持的参数
+    saturating_params = [
+        "saturating_cap_mode",
+        "saturating_cap_scale",
+        "saturating_cap",
+        "saturating_floor_mode",
+        "saturating_floor_scale",
+        "saturating_floor"
+    ]
+
+    def __init__(self):
+
+        """类初始化方法"""
+        super().__init__()
+
+        # 扩展参数
+        self.extend_params = None
+
+        """ 自定义参数设置 """
+        # growth 默认为liner, 可选范围: logistic, liner
+        self.growth_mode = "linear"
+
+        # 饱和最大值
+        # 0 未指定, 如果saturating_cap不为None那么使用手动指定的值
+        # 1: 自动选择最大值, saturating_cap = saturating_cap * saturating_cap_scale
+        # 2: 自动选择最大值 * 1.2
+        self.saturating_cap_mode = 0
+        self.saturating_cap_scale = 1.2
+        self.saturating_cap = None
+
+        # 饱和最小值
+        # 0 未指定, 如果saturating_floor不为None那么使用手动指定的值
+        # 1: 自动选择最大值, saturating_floor = saturating_floor * saturating_floor_scale
+        # 2: 自动选择最大值 * 1.2
+        self.saturating_floor_mode = 0
+        self.saturating_floor_scale = 0.8
+        self.saturating_floor = None
+
+        # 节假日 国家参数
+        self.country = None
+        # todo 从自定义节假日参数, 需要指定配置文件、或者配置key
+        self.custom_holidays = None
+
+        self.weekly_seasonality = 'auto'
+        self.yearly_seasonality = 'auto'
+        self.daily_seasonality  = 'auto'
+
+        # 数据采样 
+        # '1S' 每 1 秒
+        # '1T' 每 1 分钟
+        # '1H' 每 1 小时
+        # '1D' 每 1 天
+        # '1W' 每 1 周
+        # '1M' 每 1 月
+        # '1Q' 每 1 季度
+        # '1A' 每 1 年
+        self.resample = None
+
+        # 数据采样方法 
+        # .mean() 平均值（默认）
+        # .sum() 求和
+        # .min() 最小值
+        # .max() 最大值
+        # .count() 数量（样本个数）
+        self.resample_method = 'mean'
+
+    def execute(self):
+        data = self.__dict__
+
+        # 数据预处理、数据读取
+        df = pd.DataFrame({
+            'ds': pd.to_datetime(data['ts_list'], unit='ms'),
+            'y': data['list']
+        })
+
+        # 数据预处理、数据排序
+        df = df.sort_values(by='ds').reset_index(drop=True)
+
+        # 数据预处理、数据采样
+        df_resampled = df
+        if self.resample is not None:
+            df_resampled = df.set_index('ds').resample(self.resample).agg(self.resample_method).reset_index()
+
+        # 选择模型
+        if self.growth_mode == "logistic":
+            return self.executeLogistic(df_resampled)
+        
+        # 默认使用线性增长模式
+        return self.executeLinear(df_resampled)
+    
+        # 设置饱和上限
+        df['cap'] = 342
+        # 初始化并拟合模型，指定增长为逻辑增长，这是必要的步骤以使用饱和趋势
+        m = Prophet(growth='logistic')
+        m.fit(df)
+        # 创建未来日期的数据帧，需要包括饱和上限
+        # future = m.make_future_dataframe(start='2025-05-28 00:00:00', periods=1024, freq='84S')
+        start_time = pd.to_datetime('2025-05-26 00:00:00')
+        periods = 1024
+        interval = '84S'
+        future = pd.DataFrame({'ds': pd.date_range(start=start_time, periods=periods, freq=interval)})
+        future['cap'] = 342
+
+        # 预测未来的数据
+        forecast = m.predict(future)
+        print("zhenjun debug-----------------------------------")
+        print(forecast)
+        print("zhenjun debug-----------------------------------")
+
+        # df 是训练数据
+        last_date = df['ds'].max()  # 训练数据最后一天
+
+        # 预测结果，只取未来日期 > last_date 的行
+        forecast_1024 = forecast.tail(1024)
+        # future_forecast = forecast[forecast['ds'] > last_date]
+
+        """ 算法逻辑的核心实现"""
+        res = []
+
+        """这个预测算法固定返回 1 作为预测值，预测值的数量是用户通过 self.fc_rows 指定"""
+        # ts_list = [self.start_ts + i * self.time_step for i in range(self.rows)]
+        timestamp_ms = forecast_1024['ds'].astype('int64') // 10 ** 6
+        res.append(timestamp_ms.tolist())  # 设置预测结果时间戳列
+
+        """生成全部为 1 的预测结果 """
+        res_list = [1] * self.rows
+        # res.append(res_list)
+        res.append(forecast_1024['yhat'].tolist())
+
+        """检查用户输入，是否要求返回预测置信区间上下界"""
+        if self.return_conf:
+            """对于没有计算预测置信区间上下界的算法，直接返回预测值作为上下界即可"""
+            bound_list = [1] * self.rows
+            # res.append(bound_list)  # 预测结果置信区间下界
+            # res.append(bound_list)  # 预测结果执行区间上界
+            res.append(forecast_1024['yhat_lower'].tolist())
+            res.append(forecast_1024['yhat_upper'].tolist())
+
+        """返回结果"""
+        return {"res": res, "mse": 0}
+
+    # 执行线性模式
+    def executeLinear(self, df):
+        # 参数设置 - 饱和参数，暂不支持
+        # 计算floor
+        m = Prophet(growth='linear', interval_width=self.conf)
+
+        # 参数设置 - 开启国家节假日参数设置
+        if self.country is not None:
+            # 如果 country 不为 None，则使用 country
+            m.add_country_holidays(country_name=self.country)
+        # 参数设置 - 开启不确定区间参数设置
+
+        # 参数设置 - 开启乘法季节性设置
+
+        # 参数设置 - 开启趋势变化点设置
+
+        # 预测点开始时间
+        start_time = df['ds'].max()
+        if self.start_ts is not None:
+            # 如果 start_ts 不为 None，则使用 start_ts
+            start_time = pd.to_datetime(self.start_ts, unit='s')
+
+        # 预测点数量，预测点间隔, 单位为秒
+        freq = None
+        if self.time_step is not None:
+            # 如果 time_step 不为 None，则使用 time_step
+            freq = f'{self.time_step}S'
+        
+        if freq is None and self.resample is not None:
+            validated_freq = self.validate_freq(self.resample)
+
+        # 预测点数量，不需要包含历史数据
+        future = m.make_future_dataframe(start_time=start_time, periods=self.fc_rows, freq=validated_freq, include_history=False)
+
+        # 饱和参数设置
+        cap     = self.get_cap(df)
+        floor   = self.get_floor(df)
+        if cap is not None:
+            df['cap'] = cap
+            future['cap'] = cap
+
+        if floor is not None:
+            df['floor'] = floor
+            future['floor'] = floor
+
+        """ 算法逻辑的核心实现"""
+        # 训练并进行预测
+        m.fit(df)
+        forecast = m.predict(future)
+
+        timestamp_ms = forecast['ds'].astype('int64') // 10 ** 6
+
+        res = []
+        # 设置预测结果时间戳列
+        res.append(timestamp_ms.tolist()) 
+        # 设置预测结果
+        res.append(forecast['yhat'].tolist())
+
+        """检查用户输入，是否要求返回预测置信区间上下界"""
+        if self.return_conf:
+            res.append(forecast['yhat_lower'].tolist())
+            res.append(forecast['yhat_upper'].tolist())
+
+        """返回结果"""
+        return {"res": res, "mse": 0}
+    
+    # 执行逻辑模式
+    def executeLogistic(self, df):
+        prophet_params = {k: self.extend_params[k] for k in self.extend_params if k in self.allowed_params}
+        m = Prophet(**prophet_params)
+
+        # m = Prophet(growth='logistic', interval_width=self.conf)
+
+        # 参数设置 - 开启节假日参数设置
+        # 参数设置 - 开启不确定区间参数设置
+        # 参数设置 - 开启乘法季节性设置
+        # 参数设置 - 开启趋势变化点设置
+
+        # 预测点开始时间
+        start_time = df['ds'].max()
+        if self.start_ts is not None:
+            # 如果 start_ts 不为 None，则使用 start_ts
+            start_time = pd.to_datetime(self.start_ts, unit='s')
+
+        # 预测点数量，预测点间隔, 单位为秒
+        freq = None
+        if self.time_step is not None:
+            # 如果 time_step 不为 None，则使用 time_step
+            freq = f'{self.time_step}S'
+        
+        if freq is None and self.resample is not None:
+            validated_freq = self.validate_freq(self.resample)
+
+        # 预测点数量，不需要包含历史数据
+        future = m.make_future_dataframe(start_time=start_time, periods=self.fc_rows, freq=validated_freq, include_history=False)
+
+        # 饱和参数设置
+        cap     = self.get_cap(df)
+        floor   = self.get_floor(df)
+        if cap is not None:
+            df['cap'] = cap
+            future['cap'] = cap
+
+        if floor is not None:
+            df['floor'] = floor
+            future['floor'] = floor
+
+        """ 算法逻辑的核心实现"""
+        # 训练并进行预测
+        m.fit(df)
+        forecast = m.predict(future)
+
+        timestamp_ms = forecast['ds'].astype('int64') // 10 ** 6
+
+        res = []
+        # 设置预测结果时间戳列
+        res.append(timestamp_ms.tolist()) 
+        # 设置预测结果
+        res.append(forecast['yhat'].tolist())
+
+        """检查用户输入，是否要求返回预测置信区间上下界"""
+        if self.return_conf:
+            res.append(forecast['yhat_lower'].tolist())
+            res.append(forecast['yhat_upper'].tolist())
+
+        """返回结果"""
+        return {"res": res, "mse": 0}
+
+    # 设置算法参数
+    def set_params(self, params):
+        """该算法无需任何输入参数，直接调用父类函数，不处理算法参数设置逻辑"""
+        # 获取默认参数设置
+        super().set_params(params)
+
+        # 获取扩展参数
+        self.extend_params = params.get('extend_params', None)
+
+        # 获取自定义参数
+        filtered = {k: v for k, v in params.items() if k != "ts_list" and k != "list"}
+
+        print(filtered)
+
+        # 如果不为None，则修改默认配置
+        if 'growth_mode' in filtered and filtered['growth_mode'] is not None:        
+            self.growth_mode = filtered['growth_mode']
+
+        if 'saturating_cap_mode' in filtered and filtered['saturating_cap_mode'] is not None:
+            self.saturating_cap_mode = filtered['saturating_cap_mode']
+
+        if 'saturating_cap_scale' in filtered and filtered['saturating_cap_scale'] is not None:
+            self.saturating_cap_scale = filtered['saturating_cap_scale']
+
+        if 'saturating_cap' in filtered and filtered['saturating_cap'] is not None:
+            self.saturating_cap = filtered['saturating_cap']
+
+        if 'saturating_floor_mode' in filtered and filtered['saturating_floor_mode'] is not None:
+            self.saturating_floor_mode = filtered['saturating_floor_mode']
+
+        if 'saturating_floor_scale' in filtered and filtered['saturating_floor_scale'] is not None:
+            self.saturating_floor_scale = filtered['saturating_floor_scale']
+
+        if 'saturating_floor' in filtered and filtered['saturating_floor'] is not None:
+            self.saturating_floor = filtered['saturating_floor']
+
+        return
+
+    # 获取饱和上限
+    def get_cap(self, df):
+        """获取饱和上限"""
+        if self.saturating_cap_mode == 0 and self.saturating_cap is not None:
+            return self.saturating_cap
+        elif self.saturating_cap_mode == 1:
+            return self.saturating_cap * self.saturating_cap_scale
+        elif self.saturating_cap_mode == 2:
+            # 从 df 数组中获取最大值
+            max_ds = df['ds'].max()
+            return max_ds * self.saturating_cap_scale
+        else:
+            return None
+        
+    # 获取饱和下限
+    def get_floor(self, df):
+        """获取饱和下限"""
+        if self.saturating_floor_mode == 0 and self.saturating_floor is not None:
+            return self.saturating_floor
+        elif self.saturating_floor_mode == 1:
+            return self.saturating_floor * self.saturating_floor_scale
+        elif self.saturating_floor_mode == 2:
+            # 从 df 数组中获取最小值
+            df_min = df['ds'].min()
+            return df_min * self.saturating_floor_scale
+        else:
+            return None
+        
+    def validate_freq(resample):
+        pattern = r'^\d*[STHDWMQA]$'  # 支持可选数字+单位，单位为秒、分钟、小时等
+        if re.match(pattern, resample):
+            return resample
+        else:
+            raise ValueError(f"Unsupported resample frequency: {resample}")
