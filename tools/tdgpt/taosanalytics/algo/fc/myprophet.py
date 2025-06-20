@@ -1,12 +1,14 @@
-import json
+import re
 import traceback
+import yaml
+from pathlib import Path
 
-from sklearn.utils import resample
+import pandas as pd
+from prophet import Prophet
 
 from taosanalytics.service import AbstractForecastService
-from prophet import Prophet
-import pandas as pd
-import re
+
+
 # 算法实现类名称 需要以下划线 "_" 开始，并以 Service 结束
 class _MyForecastService(AbstractForecastService):
     """ 定义类，从 AbstractForecastService 继承并实现其定义的抽象方法 execute  """
@@ -15,7 +17,12 @@ class _MyForecastService(AbstractForecastService):
     # 该算法的描述信息 (建议添加)
     desc = """return the prophet time series data"""
 
-    params = None
+    current_file = Path(__file__).resolve()
+    # resource 目录路径：回退 3 层再拼接
+    resource_dir = None
+    config_file_prefix = "prophet_"
+    config_file_extension = ".yaml"
+    template_file_name = None
 
     # Prophet 支持的参数，避免传入不支持的参数
     allowed_params = [
@@ -33,17 +40,6 @@ class _MyForecastService(AbstractForecastService):
         "mcmc_samples",
         "uncertainty_samples",
         "stan_backend"
-    ]
-
-    # 节假日支持的参数, 避免传入不支持的参数
-    # {
-    #     'holiday': ['spring_festival', 'spring_festival'],
-    #     'ds': pd.to_datetime(['2025-01-29', '2026-02-17']),
-    #     'lower_window': [-1, -1],  # 提前1天开始生效
-    #     'upper_window': [2, 2],  # 节假日延续2天
-    # }
-    holidays_allowed_params = [
-        "holidays",
     ]
 
     # 采样参数, 避免传入不支持的参数
@@ -86,12 +82,18 @@ class _MyForecastService(AbstractForecastService):
     ]
 
     def __init__(self):
-
         """类初始化方法"""
         super().__init__()
+        current_file = Path(__file__).resolve()
+        # resource 目录路径：回退 3 层再拼接
+        self.resource_dir = current_file.parents[4] / "cfg"
 
     def execute(self):
         try:
+            # 加载模型配置
+            config = self.load_basic_config_from_yaml()
+
+            # 加载模型数据
             data = self.__dict__
 
             # 数据预处理、数据读取
@@ -100,18 +102,16 @@ class _MyForecastService(AbstractForecastService):
                 'y': data['list']
             })
 
-            print(data)
-
             # 数据预处理、数据排序
             df = df.sort_values(by='ds').reset_index(drop=True)
 
-            # 数据预处理、数据采样
-            resample_params = self.parseResampleParams()
-            df_resampled = self.doResample(df, resample_params)
+            # 数据重采样
+            resample_params = self.get_resample_params(config)
+            df_resampled = self.do_resample(df, resample_params)
 
             # 开始训练、进行预测
-            prophet_params = self.parseProphetParams()
-            m = Prophet(**prophet_params)
+            prophet_params = self.get_prophet_params(config)
+            prophet = Prophet(**prophet_params)
 
             # 预测点开始时间
             start_time = df_resampled['ds'].max()
@@ -127,7 +127,7 @@ class _MyForecastService(AbstractForecastService):
 
             validated_freq = freq
             if freq is None and resample_params is not None:
-                validated_freq = self.validate_freq(resample_params)
+                validated_freq = self.get_validate_freq(resample_params)
 
             # 预测点数量，不需要包含历史数据
             future_pd = pd.date_range(start=start_time, periods=self.rows, freq=validated_freq)
@@ -139,14 +139,14 @@ class _MyForecastService(AbstractForecastService):
             #                                 include_history=False)
 
             # 饱和参数设置
-            self.configSaturatingParams(m, df_resampled, future)
+            self.set_saturating_params(prophet, df_resampled, future)
 
             # 参数设置 - 开启节假日参数设置
 
             """ 算法逻辑的核心实现"""
             # 训练并进行预测
-            m.fit(df)
-            forecast = m.predict(future)
+            prophet.fit(df)
+            forecast = prophet.predict(future)
 
             timestamp_ms = forecast['ds'].astype('int64') // 10 ** 6
 
@@ -167,33 +167,7 @@ class _MyForecastService(AbstractForecastService):
         except Exception as e:
             traceback.print_exc()  # 打印详细堆栈
 
-    def doResample(self, df, resample_params):
-        if resample_params is None or "resample" not in resample_params:
-            return df
-
-        default_resample_method = "mean"
-        if "resample_method" in resample_params:
-            default_resample_method = resample_params["resample_method"]
-        return df.set_index('ds').resample(resample_params["resample"]).agg(default_resample_method).reset_index()
-
-    def parseProphetParams(self):
-        prophet_params = {k: self.params[k] for k in self.params if k in self.allowed_params}
-
-        if "holidays" in self.params:
-            json_str = self.params["holidays"]
-            holiday_data = json.loads(json_str)
-            holidays = pd.DataFrame(holiday_data)
-            holidays['ds'] = pd.to_datetime(holidays['ds'])
-
-            prophet_params["holidays"] = holidays
-
-        return prophet_params
-
-    def parseResampleParams(self):
-        resample_params = {k: self.params[k] for k in self.params if k in self.resample_allowed_params}
-        return resample_params
-
-    def configSaturatingParams(self, m, df_resampled, future):
+    def set_saturating_params(self, m, df_resampled, future):
         growth = m.__getattribute__("growth")
         if growth != "logistic":
             return
@@ -218,41 +192,54 @@ class _MyForecastService(AbstractForecastService):
         super().set_params(params)
 
         # 获取扩展参数
-        self.params = params
+        # 设置模型参数模板配置地址
+        self.template_file_name = None
+        if "p_cfg_tpl" in params:
+            template_name = params['p_cfg_tpl']
+            file_name = self.config_file_prefix + template_name + self.config_file_extension
+            self.template_file_name = self.resource_dir / file_name
 
-        # 获取自定义参数
+        # todo 调试目的，获取自定义参数
         filtered = {k: v for k, v in params.items() if k != "ts_list" and k != "list"}
         print(filtered)
 
         return
 
+    def get_prophet_params(self, config):
+        default_params = {'growth': 'linear'}
+        return {**default_params, **{k: config[k] for k in self.allowed_params if k in config}}
+
+    def get_resample_params(self, config):
+        resample_params = {k: config[k] for k in config if k in self.resample_allowed_params}
+        return resample_params
+
     # 获取饱和上限
     def get_cap(self, df_resampled, saturating_params):
         """获取饱和下限"""
         cap = None
-        if saturating_params.saturating_cap_max:
+        if self.str2bool(saturating_params.get("saturating_cap_max")):
             cap = df_resampled['y'].max()
-        if saturating_params.saturating_cap is not None:
-            cap = saturating_params.saturating_cap
-        if cap is not None and saturating_params.saturating_cap_scale is not None:
-            cap = cap * saturating_params.saturating_cap_scale
+        if saturating_params["saturating_cap"] is not None:
+            cap = float(saturating_params["saturating_cap"])
+        if cap is not None and saturating_params["saturating_cap_scale"] is not None:
+            cap = cap * float(saturating_params["saturating_cap_scale"])
 
         return cap
-        
+
     # 获取饱和下限
     def get_floor(self, df_resampled, saturating_params):
         """获取饱和下限"""
         floor = None
-        if saturating_params.saturating_floor_min:
+        if self.str2bool(saturating_params.get("saturating_floor_min")):
             floor = df_resampled['y'].min()
-        if saturating_params.saturating_floor is not None:
-            floor = saturating_params.saturating_floor
-        if floor is not None and saturating_params.saturating_floor_scale is not None:
-            floor = floor * saturating_params.saturating_floor_scale
+        if saturating_params["saturating_floor"] is not None:
+            floor = float(saturating_params["saturating_floor"])
+        if floor is not None and saturating_params["saturating_floor_scale"] is not None:
+            floor = floor * float(saturating_params["saturating_floor_scale"])
 
         return floor
-        
-    def validate_freq(self, resample_params):
+
+    def get_validate_freq(self, resample_params):
         if "resample" not in resample_params:
             return
 
@@ -262,3 +249,70 @@ class _MyForecastService(AbstractForecastService):
             return resample
         else:
             raise ValueError(f"Unsupported resample frequency: {resample}")
+
+    def do_resample(self, df, resample_params):
+        if resample_params is None or "resample" not in resample_params:
+            return df
+
+        default_resample_method = "mean"
+        if "resample_method" in resample_params:
+            default_resample_method = resample_params["resample_method"]
+        return df.set_index('ds').resample(resample_params["resample"]).agg(default_resample_method).reset_index()
+
+    def load_basic_config_from_yaml(self) -> dict:
+        # 获取配置模板文件
+        yaml_path = self.template_file_name
+        print(yaml_path)
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            raw_params = yaml.safe_load(f)
+
+        result = {}
+
+        # 布尔型参数
+        for key in ['daily_seasonality', 'weekly_seasonality', 'yearly_seasonality', 'saturating_cap_max', 'saturating_floor_min']:
+            if key in raw_params:
+                result[key] = self.str_to_bool(raw_params[key])
+
+        # 浮点型参数
+        for key in ['changepoint_prior_scale', 'seasonality_prior_scale', 'holidays_prior_scale',
+                    'saturating_cap', 'saturating_cap_scale', 'saturating_floor', 'saturating_floor_scale']:
+            if key in raw_params:
+                result[key] = self.to_float(raw_params[key])
+
+        # 字符串型参数
+        for key in ['seasonality_mode', 'growth', 'stan_backend', 'resample', 'resample_mode']:
+            if key in raw_params:
+                result[key] = str(raw_params[key])
+
+        holidays = []
+        for item in raw_params.get('holidays', []):
+            holiday_name = item.get('holiday')
+            dates = item.get('dates', [])
+            lower_window = item.get('lower_window', 0)
+            upper_window = item.get('upper_window', 0)
+
+            for date_str in dates:
+                holidays.append({
+                    'holiday': holiday_name,
+                    'ds': pd.to_datetime(date_str),
+                    'lower_window': lower_window,
+                    'upper_window': upper_window
+                })
+        raw_params['holidays'] = holidays
+
+        return result
+
+    # 转换True 或者 False
+    def str2bool(self, value):
+        if value is None:
+            return False
+        return str(value).lower() in ("true", "false", "True", "False")
+
+    def str_to_bool(self, val: str) -> bool:
+        return str(val).lower() in ['true', 'True']
+
+    def to_float(self, val: str) -> float | None:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
